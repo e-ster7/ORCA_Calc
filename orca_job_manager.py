@@ -24,7 +24,6 @@ class OrcaExecutor:
         """Workerスレッドから呼び出され、ORCAジョブの実行を処理する。"""
         
         inp_path = Path(inp_file)
-        # ORCAジョブの実行に必要な全てのパスを準備
         work_dir = Path(self.config['paths']['working_dir']) / inp_path.stem
         product_dir = Path(self.config['paths']['product_dir'])
         orca_path = work_dir / inp_path.name
@@ -33,10 +32,20 @@ class OrcaExecutor:
         self.handler.update_status_running(str(inp_path)) # 状態をRUNNINGに更新
         
         try:
-            ensure_directory(work_dir) # work_dirを作成
-            shutil.copy(inp_path, work_dir) # inpファイルをwork_dirにコピー
+            # ★★★ ここからが変更点 (Phase 1: 準備フェーズ) ★★★
+            try:
+                ensure_directory(work_dir) # work_dirを作成
+                shutil.copy(inp_path, work_dir) # inpファイルをwork_dirにコピー
+            except (IOError, OSError) as e:
+                # ファイルI/Oエラー（ディスクフル、ネットワーク切断など）
+                self.logger.error(f"File I/O error for {mol_name} (Recoverable): {e}")
+                current_retries = self.handler.state_store.increment_retry_count(str(inp_path))
+                # OSエラーはリトライ可能（RECOVERABLE）として扱う
+                self.handler.handle_failure(str(inp_path), mol_name, f"OS Error: {e}", current_retries, "RECOVERABLE")
+                return # executeメソッドを終了
+            # ★★★ 変更点ここまで ★★★
 
-            # --- ORCA プロセスの実行 ---
+            # --- ORCA プロセスの実行 (Phase 2: 実行フェーズ) ---
             with open(output_path, 'w') as out_f:
                 subprocess.run(
                     [self.orca_executable, str(orca_path)],
@@ -47,39 +56,32 @@ class OrcaExecutor:
                 )
             
             # --- 結果のチェック ---
-            # ★★★ 変更点 ★★★
             success, message, error_type = check_orca_output(output_path) # orca_utilsに依存
             
             # --- 結果の委託 ---
             if success:
                 self.handler.handle_success(orca_path, mol_name, calc_type, work_dir, product_dir)
             else:
-                # ★★★ ここからが変更点 ★★★
-                # OrcaExecutorはStateStoreを直接持たないため、Handler経由でアクセスする
                 current_retries = self.handler.state_store.increment_retry_count(str(inp_path))
-                # error_type を handle_failure に渡す
+                # orca_utils から渡された error_type をそのまま渡す
                 self.handler.handle_failure(str(inp_path), mol_name, message, current_retries, error_type)
-                # ★★★ 変更点ここまで ★★★
                 
         except Exception as e:
-            self.logger.error(f"Execution error for {mol_name} ({calc_type}): {e}")
-            
-            # ★★★ ここからが変更点 ★★★
-            # 実行時例外でもリトライ回数を増やし、ハンドラに渡す
+            # ★★★ ここからが変更点 (Phase 2 の例外) ★★★
+            # subprocess.run 自体の失敗など、予期せぬ実行時エラー
+            self.logger.error(f"Execution error for {mol_name} (Fatal): {e}")
             current_retries = self.handler.state_store.increment_retry_count(str(inp_path))
             error_message = f'Execution Error: {e}'
-            # 実行時例外は基本的に 'FATAL' 扱いとする
-            self.handler.handle_failure(str(inp_path), mol_name, error_message, current_retries, "FATAL")
+            # 実行時例外は 'FATAL_EXECUTION' (リトライ不要) として扱う
+            self.handler.handle_failure(str(inp_path), mol_name, error_message, current_retries, "FATAL_EXECUTION")
             # ★★★ 変更点ここまで ★★★
             
         finally:
-            # ★★★ ここからが変更点 (Task 3.2 GC機能) ★★★
-            # 仕様書3.2.1a: ジョブ完了後（成功・失敗問わず）、作業ディレクトリを削除
+            # ガベージコレクション (Task 3.2)
             try:
                 shutil.rmtree(work_dir, ignore_errors=True)
                 self.logger.info(f"Cleaned up working directory: {work_dir}")
             except Exception as e:
                 self.logger.error(f"Failed to cleanup working directory {work_dir}: {e}")
-            # ★★★ 変更点ここまで ★★★
 
             inp_path.unlink(missing_ok=True) # 元のinpファイルを削除
