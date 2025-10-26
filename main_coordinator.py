@@ -84,16 +84,28 @@ class JobScheduler:
             worker.join()
         self.logger.info("All JobScheduler workers stopped.")
 
-    def add_job(self, inp_file, mol_name, calc_type):
-        """Adds a new job to the queue."""
-        new_job_info = {'molecule': mol_name, 'calc_type': calc_type}
-        if self.state_store.has_pending_or_running(new_job_info):
-            self.logger.warning(f"Job for {mol_name}/{calc_type} is already running or pending. Skipping.")
-            return
+    # ★★★ ここからが変更点 (add_job) ★★★
+    def add_job(self, inp_file, mol_name, calc_type, is_recovery=False):
+        """
+        Adds a new job to the queue.
+        is_recovery=True の場合、重複チェックをスキップして強制的に再キューイングします。
+        """
+        
+        if not is_recovery:
+            new_job_info = {'molecule': mol_name, 'calc_type': calc_type}
+            if self.state_store.has_pending_or_running(new_job_info):
+                self.logger.warning(f"Job for {mol_name}/{calc_type} is already running or pending. Skipping.")
+                return
 
-        self.state_store.add_job(mol_name, calc_type, str(inp_file))
+        # add_jobはステータスを'PENDING'として上書き（または新規作成）します
+        self.state_store.add_job(mol_name, calc_type, str(inp_file), status='PENDING')
         self.job_queue.put((inp_file, mol_name, calc_type))
-        self.logger.info(f"Added new job: {mol_name} ({calc_type}). Queue size: {self.job_queue.qsize()}")
+        
+        if is_recovery:
+            self.logger.info(f"Recovered job: {mol_name} ({calc_type}). Re-queued.")
+        else:
+            self.logger.info(f"Added new job: {mol_name} ({calc_type}). Queue size: {self.job_queue.qsize()}")
+    # ★★★ 変更点ここまで (add_job) ★★★
 
 
 def main():
@@ -139,6 +151,25 @@ def main():
     # -----------------------------------------------------------
     # 3. 実行順序の制御 (メインロジック)
     # -----------------------------------------------------------
+
+    # ★★★ ここからが変更点 (リカバリロジック) ★★★
+    logger.info("Checking for interrupted jobs...")
+    # 1. 'RUNNING' ステータスのジョブを StateStore から検索
+    recovered_jobs = state_store.get_jobs_by_status('RUNNING')
+    
+    if recovered_jobs:
+        logger.warning(f"Found {len(recovered_jobs)} running jobs. Re-queuing them...")
+        # 2. 見つかったジョブをスケジューラにリカバリとして再登録
+        for job_id, job_info in recovered_jobs:
+            scheduler.add_job(
+                job_id, # job_id は orca_path (inp_file)
+                job_info['molecule'],
+                job_info['calc_type'],
+                is_recovery=True # リカバリフラグを立てる
+            )
+    else:
+        logger.info("No interrupted jobs found. Proceeding with normal startup.")
+    # ★★★ 変更点ここまで (リカバリロジック) ★★★
     
     # 既存INPファイルの処理 (JobSchedulerのadd_jobを使用)
     waiting_dir = Path(config['paths']['waiting_dir'])
