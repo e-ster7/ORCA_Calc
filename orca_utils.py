@@ -17,6 +17,18 @@ except ImportError:
     
 _orca_utils_logger = get_logger('orca_utils')
 
+# ★★★ ここからが変更点 ★★★
+# 致命的（リトライ不要）なエラーパターンを定義
+FATAL_ERROR_PATTERNS = [
+    re.compile(r"Basis set.+not found", re.IGNORECASE),
+    re.compile(r"Unknown keyword", re.IGNORECASE),
+    re.compile(r"FATAL ERROR", re.IGNORECASE),
+    re.compile(r"ABORTING THE RUN", re.IGNORECASE),
+    re.compile(r"Could not find.+basis", re.IGNORECASE),
+    re.compile(r"Error in input line", re.IGNORECASE),
+]
+# ★★★ 変更点ここまで ★★★
+
 # --- ORCA INPUT GENERATION ---
 
 def generate_orca_input(config, mol_name, atoms, coords, calc_type='opt'):
@@ -67,29 +79,49 @@ def parse_xyz(xyz_content):
 # --- ORCA OUTPUT UTILITIES ---
 
 def check_orca_output(output_path):
-    """Checks ORCA output file for successful completion and errors."""
+    """
+    Checks ORCA output file for success/failure and classifies error type.
+    Returns: (success (bool), message (str), error_type ('RECOVERABLE' or 'FATAL'))
+    (仕様書に基づく変更)
+    """
     # ... (元のコードのロジックを再現)
     output_path = Path(output_path)
     if not output_path.exists():
-        return False, "Output file not found."
+        # ★★★ 変更点 ★★★
+        return False, "Output file not found.", "FATAL"
     
     with open(output_path, 'r', errors='ignore') as f:
         content = f.read()
 
+    # 1. 成功のチェック
     if re.search(r"ORCA TERMINATED NORMALLY", content, re.IGNORECASE):
         if 'opt' in output_path.stem:
             if re.search(r"THE OPTIMIZATION HAS CONVERGED", content):
-                return True, "Optimization successful."
+                # ★★★ 変更点 ★★★
+                return True, "Optimization successful.", "N/A"
             else:
-                return False, "Optimization failed to converge."
-        return True, "Job successful (terminated normally)."
+                # ★★★ 変更点 ★★★
+                # 収束失敗はリトライ可能
+                return False, "Optimization failed to converge.", "RECOVERABLE"
+        # ★★★ 変更点 ★★★
+        return True, "Job successful (terminated normally).", "N/A"
 
-    if re.search(r"FATAL ERROR", content, re.IGNORECASE):
-        return False, "Fatal ORCA error detected."
-    if re.search(r"ABORTING THE RUN", content, re.IGNORECASE):
-        return False, "Run aborted."
+    # 2. 失敗のチェック (致命的エラー)
+    # ★★★ ここからが変更点 ★★★
+    for pattern in FATAL_ERROR_PATTERNS:
+        match = pattern.search(content)
+        if match:
+            message = match.group(0).strip()
+            return False, f"Fatal Error: {message}", "FATAL"
+    # ★★★ 変更点ここまで ★★★
 
-    return False, "ORCA job did not terminate normally or failed to converge."
+    # 3. その他の失敗 (リトライ可能とみなす)
+    # (例: SCF未収束だが、FATALやABORTINGではない場合)
+    if re.search(r"SCF NOT CONVERGED", content, re.IGNORECASE):
+        return False, "SCF failed to converge.", "RECOVERABLE"
+
+    # ★★★ 変更点 ★★★
+    return False, "ORCA job did not terminate normally.", "RECOVERABLE"
 
 
 def extract_final_structure(output_path):
