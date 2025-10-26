@@ -1,151 +1,239 @@
-# job_handler.py
-import shutil
-import traceback
+# main_coordinator_and_scheduler.py
+import sys
+import time
+import threading
 from pathlib import Path
+from queue import Queue, Empty
+from watchdog.observers import Observer
 
-# --- 依存関係のインポート ---
-from logging_utils import get_logger
-from notification_service import send_notification # 通知サービス
-from pipeline_utils import safe_write # I/Oユーティリティ
-# ORCAユーティリティ
-from orca_utils import (
-    generate_orca_input, 
-    extract_final_structure, 
-    generate_energy_plot, 
-    generate_comparison_plot
-)
+# --- 枝モジュールからのインポート ---
+from config_utils import load_config
+from logging_utils import get_logger, set_log_level
+from pipeline_utils import ensure_directory, LOG_DIR # ユーティリティ
+from state_store import StateStore
+from notification_service import NotificationThrottle, send_notification # ★ send_notification をインポート
+from file_watcher import XYZHandler, process_existing_xyz_files
+from orca_executor import OrcaExecutor # 新しい実行器
+from job_handler import JobCompletionHandler # 新しいハンドラ
 
-_handler_logger = get_logger('job_handler')
+_scheduler_logger = get_logger('scheduler')
 
-class JobCompletionHandler:
-    """ジョブ成功・失敗時の後処理と、連鎖計算のロジックを担当するクラス。"""
+class ThreadWorker(threading.Thread):
+    """Worker thread that executes jobs by calling the injected executor."""
+    def __init__(self, job_queue, manager):
+        super().__init__()
+        self.job_queue = job_queue
+        # JobSchedulerインスタンスを受け取り、executorへアクセスする
+        self.manager = manager 
+        self.daemon = True
+        self.running = True
+
+    def run(self):
+        while self.running:
+            try:
+                # job_queue.get(timeout=1) は、(inp_file, mol_name, calc_type) を返す
+                inp_file, mol_name, calc_type = self.job_queue.get(timeout=1)
+                
+                # 委託: 実行ロジックは注入されたexecutorに依頼する
+                self.manager.executor.execute(inp_file, mol_name, calc_type)
+                
+                self.job_queue.task_done()
+            except Empty:
+                # タイムアウト（キューが空）の場合はループを継続
+                continue
+            except Exception as e:
+                _scheduler_logger.error(f"Worker experienced unhandled error: {e}")
+
+    def stop(self):
+        """スレッドを安全に停止させるためのフラグ"""
+        self.running = False
+
+
+class JobScheduler:
+    """旧JobManagerの根幹: ジョブの受付、キュー管理、スレッドの開始/停止のみを行う。"""
     
-    def __init__(self, config, state_store, notification_throttle, scheduler):
+    def __init__(self, config, state_store, executor):
         # 依存関係の注入
         self.config = config
         self.state_store = state_store
-        self.notification_throttle = notification_throttle
-        self.scheduler = scheduler # JobSchedulerのインスタンス
-        self.logger = _handler_logger
+        self.executor = executor # 実行器 (OrcaExecutor) が注入される
         
-        # ★★★ ここからが変更点 ★★★
-        # 仕様書2.3.2: configから最大リトライ回数を読み込む
-        try:
-            # config.get() は文字列を返すため int() が必要
-            self.max_retries = int(config.get('pipeline', 'max_retries', fallback=3))
-        except ValueError:
-            self.logger.warning("Invalid 'max_retries' in config, defaulting to 3.")
-            self.max_retries = 3
-        # ★★★ 変更点ここまで ★★★
-
-    def set_scheduler(self, scheduler):
-        """循環依存解決のため、後からschedulerインスタンスを注入するメソッド。"""
-        self.scheduler = scheduler
-
-    # --- 状態更新のユーティリティメソッド ---
-    def update_status_running(self, inp_path):
-        self.state_store.update_status(inp_path, 'RUNNING')
-
-    def update_status_error(self, inp_path, message):
-        # このメソッドは Executor から直接呼ばれなくなったため、
-        # handle_failure が主要なエラー更新ポイントとなる
-        self.state_store.update_status(inp_path, f'FAILED: {message}')
-
-    # --- 成功時のハンドリング ---
-    def handle_success(self, orca_path, mol_name, calc_type, work_dir, product_dir):
-        """Handles successful ORCA job completion."""
-        self.logger.info(f"Job completed successfully: {mol_name} ({calc_type})")
-
-        output_path = orca_path.with_suffix('.out')
-        final_output_path = product_dir / output_path.name
+        self.logger = _scheduler_logger
+        self.num_threads = int(self.config['orca']['num_threads'])
         
-        shutil.copy(output_path, final_output_path)
-        self.state_store.update_status(str(final_output_path), 'COMPLETED')
+        self.job_queue = Queue()
+        self.workers = []
+        self.is_running = False
 
-        generate_energy_plot(final_output_path, product_dir) # orca_utils
+    def start(self):
+        if not self.is_running:
+            self.is_running = True
+            for i in range(self.num_threads):
+                worker = ThreadWorker(self.job_queue, self)
+                self.workers.append(worker)
+                worker.start()
+            self.logger.info(f"JobScheduler started with {self.num_threads} workers.")
 
-        if calc_type == 'opt':
-            self._chain_frequency_calculation(mol_name, product_dir) # work_dirは不要
+    def shutdown(self):
+        self.is_running = False
+        for worker in self.workers:
+            worker.stop()
 
-        send_notification( # 注入されたサービスを呼び出し
-            self.config, 
-            f"Job Success: {mol_name} ({calc_type})", 
-            f"ORCA job for {mol_name} ({calc_type}) finished successfully.",
-            throttle_instance=self.notification_throttle
-        )
+    def join(self):
+        for worker in self.workers:
+            worker.join()
+        self.logger.info("All JobScheduler workers stopped.")
 
-    # --- 失敗時のハンドリング ---
-    # ★★★ ここからが変更点 (シグネチャ変更とロジック分岐) ★★★
-    def handle_failure(self, orca_path, mol_name, message, current_retries):
+    def add_job(self, inp_file, mol_name, calc_type, is_recovery=False):
         """
-        Handles ORCA job failure, checking retry counts.
-        (仕様書2.3.4に基づく変更)
+        Adds a new job to the queue.
+        is_recovery=True の場合、重複チェックをスキップして強制的に再キューイングします。
         """
         
-        if current_retries > self.max_retries:
-            # --- 恒久的な失敗 (Permanent Failure) ---
-            log_message = f"Job PERMANENTLY FAILED (Retries: {current_retries}): {mol_name}. Reason: {message}"
-            self.logger.error(log_message)
-            
-            # 状態を PERMANENT_FAILED に更新
-            self.state_store.update_status(str(orca_path), f'PERMANENT_FAILED: {message}')
-            
-            # 恒久的な失敗を通知
-            send_notification(
-                self.config, 
-                f"Job PERMANENTLY FAILED: {mol_name}", 
-                log_message,
-                throttle_instance=self.notification_throttle
-            )
+        if not is_recovery:
+            new_job_info = {'molecule': mol_name, 'calc_type': calc_type}
+            if self.state_store.has_pending_or_running(new_job_info):
+                self.logger.warning(f"Job for {mol_name}/{calc_type} is already running or pending. Skipping.")
+                return
+
+        # add_jobはステータスを'PENDING'として上書き（または新規作成）します
+        self.state_store.add_job(mol_name, calc_type, str(inp_file), status='PENDING')
+        self.job_queue.put((inp_file, mol_name, calc_type))
         
+        if is_recovery:
+            self.logger.info(f"Recovered job: {mol_name} ({calc_type}). Re-queued.")
         else:
-            # --- 一時的な失敗 (Temporary Failure) ---
-            log_message = f"Job failed (Attempt {current_retries}/{self.max_retries}): {mol_name}. Reason: {message}"
-            self.logger.warning(log_message)
+            self.logger.info(f"Added new job: {mol_name} ({calc_type}). Queue size: {self.job_queue.qsize()}")
+    
+    # ★★★ ここからが変更点 ★★★
+    def reduce_workers(self, reason="Resource"):
+        """
+        メモリ不足などのリソースエラーに応じて、
+        実行中のワーカー数を動的に減らします。
+        """
+        if self.num_threads > 1:
+            self.num_threads -= 1
             
-            # 状態を FAILED に更新 (リトライされるかもしれない)
-            self.state_store.update_status(str(orca_path), f'FAILED: {message}')
+            # 停止するワーカーをリストから取り出す
+            worker_to_stop = self.workers.pop()
+            worker_to_stop.stop()
             
-            # 一時的な失敗を通知
-            send_notification(
-                self.config, 
-                f"Job Failure (Attempt {current_retries}): {mol_name}", 
-                log_message,
-                throttle_instance=self.notification_throttle
+            log_message = (
+                f"FATAL RESOURCE ERROR ({reason}) detected. "
+                f"Dynamically reducing parallel workers to {self.num_threads}."
             )
+            self.logger.critical(log_message)
             
-            # 注: 仕様書では「リキュー」は指示されていないため、
-            # ここではステータス更新のみを行います。
-            # リキューロジックは handle_failure ではなく、
-            # main_coordinator のリカバリロジックや、
-            # FAILED状態を定期スキャンする別の仕組みで実装する必要があります。
-
+            # この重大なイベントを管理者に通知する
+            send_notification(
+                self.config,
+                "CRITICAL: Pipeline workers reduced",
+                log_message
+            )
+        else:
+            self.logger.warning(
+                f"FATAL RESOURCE ERROR ({reason}) detected, "
+                f"but cannot reduce workers further (already at 1)."
+            )
     # ★★★ 変更点ここまで ★★★
 
-    # --- 連鎖計算のロジック ---
-    def _chain_frequency_calculation(self, mol_name, product_dir):
-        """Chains an optimization job to a frequency job."""
-        opt_output = product_dir / f"{mol_name}_opt.out" 
-        
-        try:
-            atoms, coords = extract_final_structure(opt_output) # orca_utils
-            
-            if atoms and coords:
-                freq_inp_content = generate_orca_input(self.config, mol_name, atoms, coords, calc_type='freq') # orca_utils
-                
-                freq_inp_name = f"{mol_name}_freq.inp"
-                freq_inp_path = product_dir / freq_inp_name
-                
-                safe_write(freq_inp_path, freq_inp_content) # pipeline_utils
-                
-                self.logger.info(f"Generated frequency input for {mol_name} at {freq_inp_path.name}")
-                
-                # JobSchedulerに戻してジョブを追加
-                self.scheduler.add_job(str(freq_inp_path), mol_name, 'freq')
-                
-            else:
-                self.logger.error(f"Could not extract structure for {mol_name} freq chain.")
 
-        except Exception as e:
-            # tracebackを使用（元のコードの依存関係を維持）
-            self.logger.error(f"Error during frequency chain for {mol_name}: {e}\n{traceback.format_exc()}")
+def main():
+    """全体の実行順序を制御し、依存関係を注入する役割を担う幹の部分"""
+    
+    # 1. 環境設定と初期化
+    ensure_directory(LOG_DIR)
+    set_log_level('INFO')
+    logger = get_logger('pipeline')
+    
+    try:
+        config = load_config()
+    except Exception as e:
+        logger.error(f"Failed to load configuration: {e}")
+        sys.exit(1)
+
+    # -----------------------------------------------------------
+    # 2. 依存関係の初期化と注入
+    # -----------------------------------------------------------
+    
+    # サービス層の初期化
+    notification_throttle = NotificationThrottle()
+    state_store = StateStore()
+    
+    # ハンドラ層の初期化 (HandlerはサービスとSchedulerに依存)
+    # 依存関係は後で注入されるため、ここでは None で初期化
+    handler = JobCompletionHandler(config, state_store, notification_throttle, scheduler=None)
+    
+    # 実行器層の初期化 (ExecutorはHandlerとConfigに依存)
+    executor = OrcaExecutor(config, handler) 
+    
+    # スケジューラ層の初期化 (SchedulerはExecutorとStateStoreに依存)
+    scheduler = JobScheduler(config, state_store, executor) 
+    
+    # 循環依存の解決: HandlerにSchedulerを注入する (DI)
+    handler.set_scheduler(scheduler)
+
+    # パスの検証と作成 (mainの初期ロジック)
+    for path_key in ['input_dir', 'waiting_dir', 'product_dir']:
+        path = Path(config['paths'][path_key])
+        ensure_directory(path)
+
+    # -----------------------------------------------------------
+    # 3. 実行順序の制御 (メインロジック)
+    # -----------------------------------------------------------
+
+    # 起動時リカバリ (Task 2.1)
+    logger.info("Checking for interrupted jobs...")
+    recovered_jobs = state_store.get_jobs_by_status('RUNNING')
+    
+    if recovered_jobs:
+        logger.warning(f"Found {len(recovered_jobs)} running jobs. Re-queuing them...")
+        for job_id, job_info in recovered_jobs:
+            scheduler.add_job(
+                job_id, # job_id は orca_path (inp_file)
+                job_info['molecule'],
+                job_info['calc_type'],
+                is_recovery=True # リカバリフラグを立てる
+            )
+    else:
+        logger.info("No interrupted jobs found. Proceeding with normal startup.")
+    
+    # 既存INPファイルの処理 (JobSchedulerのadd_jobを使用)
+    waiting_dir = Path(config['paths']['waiting_dir'])
+    existing_inp_files = list(waiting_dir.glob('*.inp'))
+    if existing_inp_files:
+        logger.info(f"Found {len(existing_inp_files)} existing INP files in waiting directory")
+        for inp_file in existing_inp_files:
+            mol_name = inp_file.stem.replace('_opt', '').replace('_freq', '')
+            calc_type = 'freq' if '_freq' in inp_file.stem else 'opt'
+            scheduler.add_job(str(inp_file), mol_name, calc_type) # スケジューラメソッドを呼び出し
+    
+    # 既存XYZファイルの処理 (XYZHandlerのロジックを使用)
+    process_existing_xyz_files(config, scheduler) # process_existing_xyz_files はJobSchedulerに依存する
+    
+    # ジョブスケジューラの開始
+    scheduler.start()
+    
+    # ファイル監視の開始
+    input_dir = config['paths']['input_dir']
+    event_handler = XYZHandler(config, scheduler) # XYZHandlerもJobSchedulerに依存する
+    observer = Observer()
+    observer.schedule(event_handler, input_dir, recursive=False)
+    observer.start()
+    
+    logger.info(f"Watching for XYZ files in: {input_dir}")
+    logger.info("Press Ctrl+C to stop the pipeline")
+    
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Shutdown signal received")
+        observer.stop()
+        scheduler.shutdown()
+        observer.join()
+        scheduler.join()
+        logger.info("Pipeline stopped cleanly.")
+
+if __name__ == '__main__':
+    main()
