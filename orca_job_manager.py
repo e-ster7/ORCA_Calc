@@ -53,16 +53,22 @@ class OrcaExecutor:
             if success:
                 self.handler.handle_success(orca_path, mol_name, calc_type, work_dir, product_dir)
             else:
-                self.handler.handle_failure(orca_path, mol_name, message)
+                # ★★★ ここからが変更点 ★★★
+                # 仕様書2.3.3b: ハンドラを呼ぶ *前* にリトライ回数を増やす
+                current_retries = self.state_store.increment_retry_count(str(inp_path))
+                self.handler.handle_failure(str(inp_path), mol_name, message, current_retries)
+                # ★★★ 変更点ここまで ★★★
                 
         except Exception as e:
             self.logger.error(f"Execution error for {mol_name} ({calc_type}): {e}")
-            self.handler.update_status_error(str(inp_path), 'Execution Error')
+            
+            # ★★★ ここからが変更点 ★★★
+            # 実行時例外でもリトライ回数を増やし、ハンドラに渡す
+            current_retries = self.state_store.increment_retry_count(str(inp_path))
+            error_message = f'Execution Error: {e}'
+            # inp_path (job_id) と エラーメッセージ、リトライ回数を渡す
+            self.handler.handle_failure(str(inp_path), mol_name, error_message, current_retries)
+            # ★★★ 変更点ここまで ★★★
             
         finally:
             inp_path.unlink(missing_ok=True) # 元のinpファイルを削除
-                self.logger.error(f"Could not extract structure for {mol_name} freq chain.")
-
-        except Exception as e:
-            # tracebackを使用（元のコードの依存関係を維持）
-            self.logger.error(f"Error during frequency chain for {mol_name}: {e}\n{traceback.format_exc()}")
