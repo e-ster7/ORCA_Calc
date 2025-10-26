@@ -35,13 +35,25 @@ class StateStore:
     def add_job(self, mol_name, calc_type, orca_path, status='PENDING'):
         """Adds or updates a job entry."""
         job_id = orca_path 
-        self.job_info[job_id] = {
+        
+        # ★★★ ここからが変更点 ★★★
+        # 既存のジョブ情報（特にリトライ回数）を保持しつつ更新
+        existing_job = self.job_info.get(job_id, {})
+        existing_job.update({
             'molecule': mol_name,
             'calc_type': calc_type,
             'orca_path': orca_path,
             'status': status,
             'start_time': str(datetime.now())
-        }
+        })
+        
+        # 新規ジョブの場合のみリトライ回数を初期化
+        if 'retry_count' not in existing_job:
+            existing_job['retry_count'] = 0
+            
+        self.job_info[job_id] = existing_job
+        # ★★★ 変更点ここまで ★★★
+        
         self._save_state()
         
     def get_job(self, job_id):
@@ -68,7 +80,6 @@ class StateStore:
                 return True
         return False
 
-    # ★★★ ここからが変更点 ★★★
     def get_jobs_by_status(self, status):
         """
         指定されたステータスを持つすべてのジョブを取得します。
@@ -83,4 +94,26 @@ class StateStore:
                 found_jobs.append((job_id, job_info))
                 
         return found_jobs
+
+    # ★★★ ここからが変更点 (新規メソッド) ★★★
+    def increment_retry_count(self, job_id):
+        """
+        ジョブのリトライ回数を1増やします。
+        (仕様書2.3.1に基づく追加機能)
+        """
+        if job_id in self.job_info:
+            current_count = self.job_info[job_id].get('retry_count', 0)
+            self.job_info[job_id]['retry_count'] = current_count + 1
+            self._save_state()
+            return self.job_info[job_id]['retry_count']
+        return 0
+
+    def get_retry_count(self, job_id):
+        """
+        現在のリトライ回数を取得します。
+        (仕様書2.3.3の実装に必要)
+        """
+        if job_id in self.job_info:
+            return self.job_info[job_id].get('retry_count', 0)
+        return 0
     # ★★★ 変更点ここまで ★★★
