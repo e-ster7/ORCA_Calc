@@ -25,14 +25,18 @@ class OrcaExecutor:
         
         inp_path = Path(inp_file)
         work_dir = Path(self.config['paths']['working_dir']) / inp_path.stem
-        product_dir = Path(self.config['paths']['product_dir'])
+        
+        # ★★★ 修正点4: product_dir の取得（products_dir から） ★★★
+        product_dir = Path(self.config['paths'].get('product_dir', 
+                                                      self.config['paths']['products_dir']))
+        
         orca_path = work_dir / inp_path.name
         output_path = work_dir / f"{inp_path.stem}.out"
 
         self.handler.update_status_running(str(inp_path)) # 状態をRUNNINGに更新
         
         try:
-            # ★★★ ここからが変更点 (Phase 1: 準備フェーズ) ★★★
+            # Phase 1: 準備フェーズ
             try:
                 ensure_directory(work_dir) # work_dirを作成
                 shutil.copy(inp_path, work_dir) # inpファイルをwork_dirにコピー
@@ -43,7 +47,6 @@ class OrcaExecutor:
                 # OSエラーはリトライ可能（RECOVERABLE）として扱う
                 self.handler.handle_failure(str(inp_path), mol_name, f"OS Error: {e}", current_retries, "RECOVERABLE")
                 return # executeメソッドを終了
-            # ★★★ 変更点ここまで ★★★
 
             # --- ORCA プロセスの実行 (Phase 2: 実行フェーズ) ---
             with open(output_path, 'w') as out_f:
@@ -67,14 +70,12 @@ class OrcaExecutor:
                 self.handler.handle_failure(str(inp_path), mol_name, message, current_retries, error_type)
                 
         except Exception as e:
-            # ★★★ ここからが変更点 (Phase 2 の例外) ★★★
             # subprocess.run 自体の失敗など、予期せぬ実行時エラー
             self.logger.error(f"Execution error for {mol_name} (Fatal): {e}")
             current_retries = self.handler.state_store.increment_retry_count(str(inp_path))
             error_message = f'Execution Error: {e}'
             # 実行時例外は 'FATAL_EXECUTION' (リトライ不要) として扱う
             self.handler.handle_failure(str(inp_path), mol_name, error_message, current_retries, "FATAL_EXECUTION")
-            # ★★★ 変更点ここまで ★★★
             
         finally:
             # ガベージコレクション (Task 3.2)
