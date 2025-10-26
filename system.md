@@ -1,9 +1,6 @@
-はい、承知いたしました。
-プロジェクトの最終状態に基づいて、関数/メソッドの説明書とクラスの説明書をそれぞれ作成します。
 
----
 
-## 🛠️ 関数/メソッド 詳細説明書 (最終版)
+##  関数/メソッド 詳細説明書 (最終版)
 
 この文書は、プロジェクト内の主要な関数とメソッドについて、その役割、引数、依存関係を詳細に記述します。
 
@@ -84,7 +81,7 @@
 ---
 ---
 
-## 📘 クラス 詳細説明書 (最終版)
+## クラス 詳細説明書 (最終版)
 
 この文書は、プロジェクト内の主要なクラスについて、その役割、依存関係、主要メソッドを詳細に記述します。
 
@@ -196,3 +193,116 @@
     * `stop()`: サービススレッドを安全に停止させます。
     * `check_completed_jobs()`: `state_store.json` を読み込み、処理対象の完了ジョブを探します。
     * `generate_molden_file(...)`: `orca_2mkl` コマンドを実行してMoldenファイルを生成します。
+
+
+
+### 1\. ディレクトリ構成（想定）
+
+```
+ORCA_Calc/
+├── folders/
+│   ├── input/          # ユーザーがXYZファイルを入れる場所
+│   ├── waiting/        # .inpファイルが生成され、計算待ちする場所
+│   ├── working/        # ORCA計算が実行される一時ディレクトリ群
+│   ├── products/       # 計算結果（成功時）が分子ごとに保存される場所
+│   │   └── molecule_name/
+│   │       ├── molecule_name_opt.out
+│   │       ├── molecule_name_opt.gbw
+│   │       ├── molecule_name_opt_energy.png
+│   │       ├── molecule_name_opt.molden.input  (MoldenServiceが生成)
+│   │       ├── molecule_name_freq.inp          (Handlerが生成)
+│   │       └── ... (freq計算の結果もここに追加される)
+│   └── state/          # パイプラインの状態を保存する場所
+│       └── state_store.json
+├── logs/               # ログファイルが保存される場所
+│   └── orca_pipeline.log (ローテーションされる)
+├── main_coordinator.py    # パイプライン全体の起動・制御（幹）
+├── job_handler.py         # 計算結果の後処理（成功/失敗/連鎖）
+├── orca_job_manager.py    # ORCAプロセス実行 (Executor)
+├── state_store.py         # 状態の永続化
+├── file_watcher.py        # inputフォルダの監視
+├── orca_utils.py          # ORCA関連の補助関数（inp生成、out解析）
+├── molden_service.py      # Moldenファイル生成サービス（独立）
+├── notification_service.py# メール通知とレート制限
+├── config_utils.py        # 設定ファイルの読み込み
+├── logging_utils.py       # ログ設定（ローテーション含む）
+├── pipeline_utils.py      # ファイル/ディレクトリ操作の補助関数
+├── orca_config.txt        # パイプライン全体の設定ファイル
+└── orca_requirements.txt  # 必要なPythonライブラリ
+```
+
+-----
+
+### 2\. 主要な制御フローとデータフロー
+
+1.  **起動 (`main_coordinator.py`)**:
+
+      * `config.txt` を `load_config` で読み込みます。
+      * `StateStore`, `NotificationThrottle`, `JobCompletionHandler`, `OrcaExecutor`, `JobScheduler`, `MoldenService` のインスタンスを生成し、**依存性注入 (DI)** を行います。
+      * `state_store.get_jobs_by_status('RUNNING')` で中断ジョブを検出し、`scheduler.add_job(is_recovery=True)` でキューに戻します。
+      * `process_existing_xyz_files` で `input_dir` の既存XYZを処理し、`scheduler.add_job` でキューに追加します。
+      * `JobScheduler`, `MoldenService`, `Observer` (ファイル監視) スレッドを開始します。
+
+2.  **ファイル監視 (`file_watcher.py`)**:
+
+      * `XYZHandler.on_created` が `input_dir` の新規 `.xyz` ファイルを検知します。
+      * `orca_utils.parse_xyz` で座標を読み取り、`orca_utils.generate_orca_input` で `.inp` ファイルを生成します。
+      * `.inp` と `.xyz` を `waiting_dir` に移動し、`scheduler.add_job` を呼び出します。
+
+3.  **ジョブ実行 (`main_coordinator.py`, `orca_job_manager.py`)**:
+
+      * `ThreadWorker.run` がジョブキューから `(inp_file, mol_name, calc_type)` を取得します。
+      * `OrcaExecutor.execute` を呼び出します。
+      * `OrcaExecutor` は `handler.update_status_running` を呼び出し、`working_dir` を準備し、`subprocess.run` でORCAを実行します。
+      * `orca_utils.check_orca_output` で結果 (`success`, `message`, `error_type`) を判定します。
+      * 失敗時は `state_store.increment_retry_count` を呼び出します。
+      * 結果を `JobCompletionHandler` (`handle_success` または `handle_failure`) に渡します。
+      * `finally` ブロックで `working_dir` を削除します。
+
+4.  **結果処理 (`job_handler.py`)**:
+
+      * `handle_success`:
+          * `.out`, `.gbw` を `products/molecule_name/` にコピーします。
+          * `state_store.update_status` を `COMPLETED` に更新します。
+          * `generate_energy_plot` を呼び出します。
+          * (OPTの場合) `_chain_frequency_calculation` でFREQジョブを生成し `scheduler.add_job` を呼び出します。
+          * `send_notification` を呼び出します。
+      * `handle_failure`:
+          * リトライ回数 (`current_retries`) とエラータイプ (`error_type`) を評価します。
+          * `state_store.update_status` を `FAILED` または `PERMANENT_FAILED` に更新します。
+          * `send_notification` を呼び出します。
+          * (`FATAL_RESOURCE` の場合) `scheduler.reduce_workers` を呼び出します。
+
+5.  **Molden生成 (`molden_service.py`)**:
+
+      * 独立したスレッドで `run` ループが動作します。
+      * 定期的に `check_completed_jobs` で `state_store.json` を直接読み込みます。
+      * `COMPLETED` ジョブを見つけ、対応する `.gbw` が `products/molecule_name/` に存在するか確認します。
+      * `.molden.input` が未生成で `.gbw` が存在すれば `generate_molden_file` を呼び出します。
+      * `generate_molden_file` は `subprocess.run` で `orca_2mkl` コマンドを実行し、`.gbw` から `.molden.input` を生成します。失敗時はマーカーファイル (`.molden_failed`) を作成します。
+
+6.  **ログ (`logging_utils.py`, `pipeline_utils.py`)**:
+
+      * すべてのモジュールは `get_logger` でロガーを取得し、動作記録を出力します。
+      * ログはコンソールと `logs/orca_pipeline.log` に出力されます。
+      * `TimedRotatingFileHandler` により、ログファイルは毎日ローテーションされ、7世代分保持されます。
+
+7.  **通知 (`notification_service.py`)**:
+
+      * `JobCompletionHandler` や `JobScheduler` から `send_notification` が呼び出されます。
+      * `NotificationThrottle.can_send` でレート制限をチェックします。
+      * `smtplib` を使用し、**指数関数的バックオフ**によるリトライ機能付きでメールを送信します。
+
+8.  **状態管理 (`state_store.py`)**:
+
+      * `JobScheduler` と `JobCompletionHandler` がジョブの状態変化（`PENDING`, `RUNNING`, `COMPLETED`, `FAILED`, `PERMANENT_FAILED`）やリトライ回数を `update_status`, `add_job`, `increment_retry_count` メソッドで記録します。
+      * `_save_state` が呼ばれるたびに、`state_store.json` ファイルがアトミックに（安全に）更新されます。
+
+-----
+
+### 3\. 主要な設計原則
+
+  * **責務の分離 (Single Responsibility Principle):** 各クラス/モジュールは特定の役割（ファイル監視、計算実行、結果処理、状態管理など）に集中しています。
+  * **依存性注入 (Dependency Injection):** `main_coordinator.py` が中心となり、各コンポーネントに必要な依存オブジェクト（例: `JobScheduler` に `OrcaExecutor` を注入）を渡すことで、モジュール間の結合度を下げています。
+  * **堅牢性 (Robustness):** 起動時リカバリ、エラー分類（`RECOVERABLE`, `FATAL_INPUT`, `FATAL_RESOURCE`）、リトライ回数管理、OSエラーハンドリング、通知リトライ、ログローテーション、ガベージコレクションなど、多くの自己回復・自己管理機能が実装されています。
+  * **分離されたサービス (Sidecar Pattern):** `MoldenService` は、メインのパイプラインとは独立して動作し、状態ファイルを通じて緩やかに連携することで、追加機能（Molden生成）を実現しています。
