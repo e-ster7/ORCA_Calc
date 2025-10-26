@@ -25,11 +25,19 @@ class MoldenService(threading.Thread):
         self.running = True
         self.daemon = True # メインスレッドが終了したら一緒に終了
         
-        # 設定を読み込む
-        self.state_file = Path(config.get('paths', 'state_file', fallback='state_store.json'))
-        self.product_dir = Path(config.get('paths', 'product_dir'))
+        # ★★★ 修正点5: state_file のパスを state_dir から構築 ★★★
+        state_dir = Path(config.get('paths', 'state_dir', fallback='folders/state'))
+        self.state_file = state_dir / 'state_store.json'
+        
+        # ★★★ 修正点4: product_dir の取得（products_dir から） ★★★
+        self.product_dir = Path(config.get('paths', 'products_dir'))
+        
         self.orca_executable = config.get('orca', 'orca_executable')
-        self.orca_settings = config.get('orca', 'settings_opt', fallback="B3LYP D4 def2-SVP OPT TightSCF")
+        
+        # ★★★ 修正点2: settings を動的に構築 ★★★
+        method = config.get('orca', 'method', fallback='B3LYP')
+        basis = config.get('orca', 'basis', fallback='def2-SVP')
+        self.orca_settings = f"{method} {basis} OPT TightSCF"
         
         self.check_interval = 60 # 60秒ごとに state_store.json をチェック
         self.logger.info("MoldenService initialized. Watching for completed jobs...")
@@ -168,7 +176,6 @@ class MoldenService(threading.Thread):
             with open(output_path, 'r', errors='ignore') as f:
                 content = f.read()
             
-            # ★★★ ここからが修正部分 ★★★
             # パターン1: 成功時の座標ブロック (CARTESIAN COORDINATES (ANGSTROEM))
             success_pattern = re.compile(
                 r"CARTESIAN COORDINATES \(ANGSTROEM\)\s*\n-+\n(.*?)\n-{10,}",
@@ -210,7 +217,6 @@ class MoldenService(threading.Thread):
                 
                 if coord_lines:
                     return "\n".join(coord_lines)
-            # ★★★ 修正部分ここまで ★★★
             
             self.logger.warning(f"Could not find coordinate block in {output_path.name}")
             return None
