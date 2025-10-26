@@ -40,15 +40,11 @@ FATAL_RESOURCE_ERROR_PATTERNS = [
 def generate_orca_input(config, mol_name, atoms, coords, calc_type='opt'):
     """Generates the content for an ORCA input file."""
     
-    # ★★★ 修正点1: num_coresをnprocsから取得 ★★★
     num_cores = config['orca']['nprocs']
     
-    # ★★★ 修正点2: settings_opt/freqをconfig値から動的に構築 ★★★
     method = config['orca'].get('method', 'B3LYP')
     basis = config['orca'].get('basis', 'def2-SVP')
     
-    # ★★★ 修正点: 計算タイプを最初に配置 ★★★
-    # 計算タイプに応じた設定（OPT/FREQを最初に）
     if calc_type == 'opt':
         calc_type_keyword = 'OPT'
     elif calc_type == 'freq':
@@ -56,24 +52,19 @@ def generate_orca_input(config, mol_name, atoms, coords, calc_type='opt'):
     else:
         calc_type_keyword = ''
     
-    # 基本キーワードの構築: <calc_type> <method> <basis> TightSCF
     calc_keywords = f"{calc_type_keyword} {method} {basis} TightSCF"
     
-    # ★★★ 修正点: オプション設定の構築 ★★★
     optional_keywords = []
     
-    # RIJCOSX設定
     use_rijcosx = config['orca'].getboolean('use_rijcosx', fallback=False)
     if use_rijcosx:
         optional_keywords.append('RIJCOSX')
     
-    # ★★★ 修正点: 溶媒設定（空文字列チェックを追加、solvent_modelを正しく使用） ★★★
     solvent = config['orca'].get('solvent', '').strip()
-    if solvent:  # 空文字列でない場合のみ追加
+    if solvent:
         solvent_model = config['orca'].get('solvent_model', 'CPCM')
         optional_keywords.append(f'{solvent_model}({solvent})')
     
-    # オプションキーワードを追加
     if optional_keywords:
         calc_keywords += " " + " ".join(optional_keywords)
     
@@ -230,7 +221,6 @@ def _parse_coordinate_block(coords_block, format_type='success'):
         parts = line.split()
         
         # 成功時のフォーマット: Element X Y Z
-        # 失敗時のフォーマット: Index Element X Y Z
         if format_type == 'success' and len(parts) >= 4:
             try:
                 atom = parts[0]
@@ -239,15 +229,28 @@ def _parse_coordinate_block(coords_block, format_type='success'):
                 coords.append(coord)
             except (ValueError, IndexError):
                 continue
-        elif format_type == 'failure' and len(parts) >= 5:
+        
+        # ★★★ ここからが修正点 ★★★
+        # 失敗時のフォーマット: (Index) Element X Y Z
+        elif format_type == 'failure' and len(parts) >= 4: # 実際には 5 >= 4
             try:
-                # 失敗時は Index Element X Y Z の形式なので、インデックスを飛ばす
-                atom = parts[0]  # 実際には元素記号
-                coord = [float(parts[1]), float(parts[2]), float(parts[3])]
+                # 失敗時は Index(0) Element(1) X(2) Y(3) Z(4) の形式
+                # ...ですが、ORCA 5.0.4では Index Element X Y Z のようです。
+                # 確実性を高めるため、最後の3つを座標とし、その前を元素記号とします。
+                
+                atom = parts[-4] # 元素記号
+                x = float(parts[-3]) # X座標
+                y = float(parts[-2]) # Y座標
+                z = float(parts[-1]) # Z座標
+                
+                coord = [x, y, z]
                 atoms.append(atom)
                 coords.append(coord)
+                
             except (ValueError, IndexError):
+                # ヘッダー行などをスキップ
                 continue
+        # ★★★ 修正点ここまで ★★★
     
     if not atoms:
         _orca_utils_logger.warning("No valid coordinates found in block")
@@ -276,7 +279,7 @@ def generate_energy_plot(output_path, save_dir):
         return False
     
     try:
-        data = _get_energy_data(output_path)
+        data = _get_E_data(output_path)
         if not data:
             _orca_utils_logger.info("No energy data found for plotting.")
             return False
