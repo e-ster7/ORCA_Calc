@@ -279,7 +279,7 @@ def generate_energy_plot(output_path, save_dir):
         return False
     
     try:
-        data = _get_E_data(output_path)
+        data = _get_energy_data(output_path)
         if not data:
             _orca_utils_logger.info("No energy data found for plotting.")
             return False
