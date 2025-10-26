@@ -5,10 +5,9 @@ import json
 import subprocess
 from pathlib import Path
 import shutil
+import re  # ★★★ 修正点 1: 'import re' を追加 ★★★
 
 # --- プロジェクト内インポート (ユーティリティのみ) ---
-# ご要望に基づき、主要クラス（StateStore, JobHandler等）はインポートしません。
-# シンプルな関数（ロギングとディレクトリ作成）のみインポートします。
 from logging_utils import get_logger
 from pipeline_utils import ensure_directory
 
@@ -30,7 +29,6 @@ class MoldenService(threading.Thread):
         self.state_file = Path(config.get('paths', 'state_file', fallback='state_store.json'))
         self.product_dir = Path(config.get('paths', 'product_dir'))
         self.orca_executable = config.get('orca', 'orca_executable')
-        # configから計算設定を読み込む（Molden実行時に必要）
         self.orca_settings = config.get('orca', 'settings_opt', fallback="B3LYP D4 def2-SVP OPT TightSCF")
         
         self.check_interval = 60 # 60秒ごとに state_store.json をチェック
@@ -61,7 +59,6 @@ class MoldenService(threading.Thread):
             return
 
         try:
-            # StateStoreクラスを使わずに、jsonを直接読み込む
             with open(self.state_file, 'r') as f:
                 state_data = json.load(f)
         except json.JSONDecodeError:
@@ -69,7 +66,6 @@ class MoldenService(threading.Thread):
             return
 
         for job_id, info in state_data.items():
-            # 完了した 'opt' ジョブを探す
             if info.get('status') == 'COMPLETED' and info.get('calc_type') == 'opt':
                 
                 mol_name = info.get('molecule')
@@ -77,29 +73,31 @@ class MoldenService(threading.Thread):
                     continue
                     
                 mol_product_dir = self.product_dir / mol_name
-                # job_handler が生成するはずの最適化済み .out ファイル
                 opt_out_file = mol_product_dir / f"{mol_name}_opt.out"
-                # 生成したい Molden ファイル
                 molden_file = mol_product_dir / f"{mol_name}.molden.input"
                 
-                # 既にMoldenファイルが存在するかチェック
-                if molden_file.exists():
+                # ★★★ 修正点 3: 無限リトライ防止 ★★★
+                # 失敗した場合のマーカーファイル
+                molden_failed_marker = mol_product_dir / f"{mol_name}.molden_failed"
+                
+                # 既に成功しているか、恒久的に失敗している場合はスキップ
+                if molden_file.exists() or molden_failed_marker.exists():
                     continue
+                # ★★★ 修正点 3 ここまで ★★★
                     
-                # .out ファイル（成功の証）が存在するかチェック
                 if not opt_out_file.exists():
                     self.logger.debug(f"opt.out not yet found for {mol_name}, skipping.")
                     continue
                 
                 self.logger.info(f"Found completed job to process for Molden: {mol_name}")
-                self.generate_molden_file(mol_name, mol_product_dir, opt_out_file)
+                # 失敗マーカーファイルのパスも渡す
+                self.generate_molden_file(mol_name, mol_product_dir, opt_out_file, molden_failed_marker)
 
-    def generate_molden_file(self, mol_name, mol_product_dir, opt_out_file):
+    def generate_molden_file(self, mol_name, mol_product_dir, opt_out_file, molden_failed_marker):
         """
         OrcaExecutor や orca_utils に依存せず、
         Moldenファイル生成のためだけにORCAを直接呼び出す。
         """
-        # Molden生成専用の一時ディレクトリを作成
         molden_run_dir = mol_product_dir / "molden_run"
         ensure_directory(molden_run_dir)
         
@@ -111,15 +109,15 @@ class MoldenService(threading.Thread):
             
             if not final_coords_block:
                 self.logger.warning(f"Could not extract final coords from {opt_out_file.name}")
-                shutil.rmtree(molden_run_dir, ignore_errors=True)
+                # ★★★ 修正点 3: 失敗マーカーを作成 ★★★
+                molden_failed_marker.touch()
                 return
 
             # 2. Molden用入力ファイルを作成
-            # %moinp キーワードを追加し、計算は OPT ではなく単一点計算 (SP) にする
+            # 'OPT' を 'SP' (単一点計算) に置き換える
             calc_keywords = self.orca_settings.replace("OPT", "SP")
             
             molden_inp_content = f"""# Molden generation for {mol_name}
-            
 ! {calc_keywords}
 %pal nprocs 1 end
 %maxcore 1000
@@ -130,18 +128,19 @@ class MoldenService(threading.Thread):
 * xyz {self.config.get('orca', 'charge', fallback=0)} {self.config.get('orca', 'multiplicity', fallback=1)}
 {final_coords_block}
 *
-  
+
+            
             with open(molden_inp_path, 'w') as f:
                 f.write(molden_inp_content)
                 
-            # 3. ORCAを実行 (Executorを使わずに直接subprocess)
+            # 3. ORCAを実行
             self.logger.info(f"Running ORCA (SP) for Molden generation: {mol_name}")
             subprocess.run(
                 [self.orca_executable, str(molden_inp_path.name)],
                 cwd=molden_run_dir,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=300 # 5分タイムアウト
+                timeout=300
             )
             
             # 4. 生成されたMoldenファイルを製品ディレクトリのトップに移動
@@ -153,9 +152,13 @@ class MoldenService(threading.Thread):
                 self.logger.info(f"Successfully generated {final_dest.name}")
             else:
                 self.logger.error(f"ORCA ran but Molden file not found for {mol_name}")
+                # ★★★ 修正点 3: 失敗マーカーを作成 ★★★
+                molden_failed_marker.touch()
                 
         except Exception as e:
             self.logger.error(f"Failed to generate Molden file for {mol_name}: {e}")
+            # ★★★ 修正点 3: 失敗マーカーを作成 ★★★
+            molden_failed_marker.touch()
         finally:
             # 一時的な実行ディレクトリを削除
             shutil.rmtree(molden_run_dir, ignore_errors=True)
@@ -168,21 +171,26 @@ class MoldenService(threading.Thread):
             with open(output_path, 'r', errors='ignore') as f:
                 content = f.read()
             
-            # FINAL COORDINATES (CARTESIAN) ブロックを探す
+            # ★★★ 修正点 2: 正規表現を修正 ★★★
+            # orca_utils.py のロジックと一致させ、終了のダッシュラインを正しく指定
             match = re.search(
-                r"FINAL COORDINATES \(CARTESIAN\)\n-+\n[^\n]*\n-+\n(.*?)\n-+\n", 
+                r"FINAL COORDINATES \(CARTESIAN\)\n-+\n[^\n]*\n-+\n(.*?)\n-{10,}", 
                 content, re.DOTALL
             )
+            # ★★★ 修正点 2 ここまで ★★★
+            
             if match:
                 coords_block = match.group(1).strip()
-                # 座標行だけを抽出して返す
                 coord_lines = []
                 for line in coords_block.split('\n'):
                     parts = line.split()
                     if len(parts) >= 4:
+                        # ORCA入力形式 (Element X Y Z) に戻す
                         coord_lines.append(f"  {parts[0]} {parts[1]} {parts[2]} {parts[3]}")
                 return "\n".join(coord_lines)
             
+            self.logger.warning(f"Regex failed to find FINAL COORDINATES in {output_path.name}")
             return None
-        except Exception:
+        except Exception as e:
+            self.logger.error(f"Error parsing coordinates from {output_path.name}: {e}")
             return None
