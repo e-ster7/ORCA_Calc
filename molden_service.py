@@ -37,7 +37,9 @@ class MoldenService(threading.Thread):
         # ★★★ 修正点2: settings を動的に構築 ★★★
         method = config.get('orca', 'method', fallback='B3LYP')
         basis = config.get('orca', 'basis', fallback='def2-SVP')
-        self.orca_settings = f"{method} {basis} OPT TightSCF"
+        # Molden生成用の設定（後でOPT→SPに置き換える）
+        self.method = method
+        self.basis = basis
         
         self.check_interval = 60 # 60秒ごとに state_store.json をチェック
         self.logger.info("MoldenService initialized. Watching for completed jobs...")
