@@ -6,7 +6,11 @@ from datetime import datetime
 
 # グローバル定数 (元のコードの定義を維持)
 LOG_DIR = Path('logs')
-log_filename = LOG_DIR / f'orca_pipeline_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+# ★★★ ここからが変更点 ★★★
+# ログローテーションのため、タイムスタンプ付きのユニークなファイル名ではなく、
+# 固定のログファイル名を使用します。
+log_filename = LOG_DIR / 'orca_pipeline.log'
+# ★★★ 変更点ここまで ★★★
 
 
 def safe_write(path, content):
