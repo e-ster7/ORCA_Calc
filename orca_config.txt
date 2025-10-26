@@ -1,0 +1,43 @@
+[paths]
+input_dir = folders/input
+waiting_dir = folders/waiting
+working_dir = folders/working
+products_dir = folders/products
+state_dir = folders/state
+
+[orca]
+# ORCA executable path (modify for your system)
+# Windows example: C:/orca/orca.exe
+# Linux example: /opt/orca/orca
+orca_executable = orca
+
+# DFT calculation parameters
+method = B3LYP
+basis = def2-SVP
+charge = 0
+multiplicity = 1
+
+# Performance settings
+nprocs = 4
+maxcore = 2000
+max_parallel_jobs = 5
+timeout_seconds = 7200
+
+# Optional features
+use_rijcosx = false
+solvent = 
+solvent_model = CPCM
+
+# Error handling
+max_retries = 2
+
+[gmail]
+# Email notifications (optional)
+enabled = false
+sender_email = your_email@gmail.com
+sender_password = your_app_specific_password
+recipient_email = recipient@example.com
+
+[notification]
+# Notification frequency (minutes)
+min_interval = 60
