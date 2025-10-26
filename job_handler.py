@@ -28,15 +28,11 @@ class JobCompletionHandler:
         self.scheduler = scheduler # JobSchedulerのインスタンス
         self.logger = _handler_logger
         
-        # ★★★ ここからが変更点 ★★★
-        # 仕様書2.3.2: configから最大リトライ回数を読み込む
         try:
-            # config.get() は文字列を返すため int() が必要
             self.max_retries = int(config.get('pipeline', 'max_retries', fallback=3))
         except ValueError:
             self.logger.warning("Invalid 'max_retries' in config, defaulting to 3.")
             self.max_retries = 3
-        # ★★★ 変更点ここまで ★★★
 
     def set_scheduler(self, scheduler):
         """循環依存解決のため、後からschedulerインスタンスを注入するメソッド。"""
@@ -47,8 +43,6 @@ class JobCompletionHandler:
         self.state_store.update_status(inp_path, 'RUNNING')
 
     def update_status_error(self, inp_path, message):
-        # このメソッドは Executor から直接呼ばれなくなったため、
-        # handle_failure が主要なエラー更新ポイントとなる
         self.state_store.update_status(inp_path, f'FAILED: {message}')
 
     # --- 成功時のハンドリング ---
@@ -65,9 +59,9 @@ class JobCompletionHandler:
         generate_energy_plot(final_output_path, product_dir) # orca_utils
 
         if calc_type == 'opt':
-            self._chain_frequency_calculation(mol_name, product_dir) # work_dirは不要
+            self._chain_frequency_calculation(mol_name, product_dir)
 
-        send_notification( # 注入されたサービスを呼び出し
+        send_notification(
             self.config, 
             f"Job Success: {mol_name} ({calc_type})", 
             f"ORCA job for {mol_name} ({calc_type}) finished successfully.",
@@ -75,17 +69,16 @@ class JobCompletionHandler:
         )
 
     # --- 失敗時のハンドリング ---
-    # ★★★ ここからが変更点 (シグネチャ変更とロジック分岐) ★★★
+    # ★★★ ここからが変更点 ★★★
     def handle_failure(self, orca_path, mol_name, message, current_retries, error_type):
         """
         Handles ORCA job failure, checking retry counts and error type.
-        (仕様書に基づく変更)
         """
         
         # 恒久的な失敗の条件:
         # 1. リトライ回数が上限を超えた
-        # 2. エラータイプが 'FATAL' (入力ミスなど)
-        is_permanent_failure = (current_retries > self.max_retries) or (error_type == "FATAL")
+        # 2. エラータイプが 'FATAL_' で始まる (FATAL_INPUT, FATAL_RESOURCE, FATAL_EXECUTION)
+        is_permanent_failure = (current_retries > self.max_retries) or (error_type.startswith("FATAL"))
 
         if is_permanent_failure:
             # --- 恒久的な失敗 (Permanent Failure) ---
@@ -95,36 +88,35 @@ class JobCompletionHandler:
             )
             self.logger.error(log_message)
             
-            # 状態を PERMANENT_FAILED に更新
             self.state_store.update_status(str(orca_path), f'PERMANENT_FAILED: {message}')
             
-            # 恒久的な失敗を通知
             send_notification(
                 self.config, 
                 f"Job PERMANENTLY FAILED: {mol_name}", 
                 log_message,
                 throttle_instance=self.notification_throttle
             )
+            
+            # 自己修復ロジック: リソース不足の場合、ワーカー数を減らす
+            if error_type == "FATAL_RESOURCE":
+                self.scheduler.reduce_workers(reason="Resource Limit")
         
         else:
-            # --- 一時的な失敗 (Temporary Failure) ---
+            # --- 一時的な失敗 (Temporary Failure / RECOVERABLE) ---
             log_message = (
                 f"Job failed (Attempt {current_retries}/{self.max_retries}, Type: {error_type}): "
                 f"{mol_name}. Reason: {message}. Will retry on next startup."
             )
             self.logger.warning(log_message)
             
-            # 状態を FAILED に更新 (リトライされるかもしれない)
             self.state_store.update_status(str(orca_path), f'FAILED: {message}')
             
-            # 一時的な失敗を通知
             send_notification(
                 self.config, 
                 f"Job Failure (Attempt {current_retries}): {mol_name}", 
                 log_message,
                 throttle_instance=self.notification_throttle
             )
-
     # ★★★ 変更点ここまで ★★★
 
     # --- 連鎖計算のロジック ---
@@ -152,5 +144,4 @@ class JobCompletionHandler:
                 self.logger.error(f"Could not extract structure for {mol_name} freq chain.")
 
         except Exception as e:
-            # tracebackを使用（元のコードの依存関係を維持）
             self.logger.error(f"Error during frequency chain for {mol_name}: {e}\n{traceback.format_exc()}")
