@@ -11,10 +11,15 @@ from config_utils import load_config
 from logging_utils import get_logger, set_log_level
 from pipeline_utils import ensure_directory, LOG_DIR # ユーティリティ
 from state_store import StateStore
-from notification_service import NotificationThrottle, send_notification # ★ send_notification をインポート
+from notification_service import NotificationThrottle, send_notification
 from file_watcher import XYZHandler, process_existing_xyz_files
 from orca_executor import OrcaExecutor # 新しい実行器
 from job_handler import JobCompletionHandler # 新しいハンドラ
+
+# ★★★ 新しいファイルのインポート ★★★
+from molden_service import MoldenService 
+# ★★★ ここまで ★★★
+
 
 _scheduler_logger = get_logger('scheduler')
 
@@ -105,7 +110,6 @@ class JobScheduler:
         else:
             self.logger.info(f"Added new job: {mol_name} ({calc_type}). Queue size: {self.job_queue.qsize()}")
     
-    # ★★★ ここからが変更点 ★★★
     def reduce_workers(self, reason="Resource"):
         """
         メモリ不足などのリソースエラーに応じて、
@@ -135,7 +139,6 @@ class JobScheduler:
                 f"FATAL RESOURCE ERROR ({reason}) detected, "
                 f"but cannot reduce workers further (already at 1)."
             )
-    # ★★★ 変更点ここまで ★★★
 
 
 def main():
@@ -152,35 +155,30 @@ def main():
         logger.error(f"Failed to load configuration: {e}")
         sys.exit(1)
 
-    # -----------------------------------------------------------
     # 2. 依存関係の初期化と注入
-    # -----------------------------------------------------------
     
     # サービス層の初期化
     notification_throttle = NotificationThrottle()
     state_store = StateStore()
     
-    # ハンドラ層の初期化 (HandlerはサービスとSchedulerに依存)
-    # 依存関係は後で注入されるため、ここでは None で初期化
+    # ハンドラ層の初期化
     handler = JobCompletionHandler(config, state_store, notification_throttle, scheduler=None)
     
-    # 実行器層の初期化 (ExecutorはHandlerとConfigに依存)
+    # 実行器層の初期化
     executor = OrcaExecutor(config, handler) 
     
-    # スケジューラ層の初期化 (SchedulerはExecutorとStateStoreに依存)
+    # スケジューラ層の初期化
     scheduler = JobScheduler(config, state_store, executor) 
     
     # 循環依存の解決: HandlerにSchedulerを注入する (DI)
     handler.set_scheduler(scheduler)
 
-    # パスの検証と作成 (mainの初期ロジック)
+    # パスの検証と作成
     for path_key in ['input_dir', 'waiting_dir', 'product_dir']:
         path = Path(config['paths'][path_key])
         ensure_directory(path)
 
-    # -----------------------------------------------------------
     # 3. 実行順序の制御 (メインロジック)
-    # -----------------------------------------------------------
 
     # 起動時リカバリ (Task 2.1)
     logger.info("Checking for interrupted jobs...")
@@ -190,15 +188,15 @@ def main():
         logger.warning(f"Found {len(recovered_jobs)} running jobs. Re-queuing them...")
         for job_id, job_info in recovered_jobs:
             scheduler.add_job(
-                job_id, # job_id は orca_path (inp_file)
+                job_id,
                 job_info['molecule'],
                 job_info['calc_type'],
-                is_recovery=True # リカバリフラグを立てる
+                is_recovery=True
             )
     else:
         logger.info("No interrupted jobs found. Proceeding with normal startup.")
     
-    # 既存INPファイルの処理 (JobSchedulerのadd_jobを使用)
+    # 既存INPファイルの処理
     waiting_dir = Path(config['paths']['waiting_dir'])
     existing_inp_files = list(waiting_dir.glob('*.inp'))
     if existing_inp_files:
@@ -206,17 +204,22 @@ def main():
         for inp_file in existing_inp_files:
             mol_name = inp_file.stem.replace('_opt', '').replace('_freq', '')
             calc_type = 'freq' if '_freq' in inp_file.stem else 'opt'
-            scheduler.add_job(str(inp_file), mol_name, calc_type) # スケジューラメソッドを呼び出し
+            scheduler.add_job(str(inp_file), mol_name, calc_type)
     
-    # 既存XYZファイルの処理 (XYZHandlerのロジックを使用)
-    process_existing_xyz_files(config, scheduler) # process_existing_xyz_files はJobSchedulerに依存する
+    # 既存XYZファイルの処理
+    process_existing_xyz_files(config, scheduler)
     
     # ジョブスケジューラの開始
     scheduler.start()
     
+    # ★★★ 新しいサービスの開始 (幹の変更点) ★★★
+    molden_watcher = MoldenService(config)
+    molden_watcher.start()
+    # ★★★ ここまで ★★★
+    
     # ファイル監視の開始
     input_dir = config['paths']['input_dir']
-    event_handler = XYZHandler(config, scheduler) # XYZHandlerもJobSchedulerに依存する
+    event_handler = XYZHandler(config, scheduler)
     observer = Observer()
     observer.schedule(event_handler, input_dir, recursive=False)
     observer.start()
@@ -231,8 +234,18 @@ def main():
         logger.info("Shutdown signal received")
         observer.stop()
         scheduler.shutdown()
+        
+        # ★★★ 新しいサービスの停止 (幹の変更点) ★★★
+        molden_watcher.stop()
+        # ★★★ ここまで ★★★
+        
         observer.join()
         scheduler.join()
+        
+        # ★★★ 新しいサービスの待機 (幹の変更点) ★★★
+        molden_watcher.join(timeout=5) # 5秒待ってスレッド終了を待つ
+        # ★★★ ここまで ★★★
+        
         logger.info("Pipeline stopped cleanly.")
 
 if __name__ == '__main__':
