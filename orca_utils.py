@@ -47,7 +47,19 @@ def generate_orca_input(config, mol_name, atoms, coords, calc_type='opt'):
     method = config['orca'].get('method', 'B3LYP')
     basis = config['orca'].get('basis', 'def2-SVP')
     
-    # オプション設定の構築
+    # ★★★ 修正点: 計算タイプを最初に配置 ★★★
+    # 計算タイプに応じた設定（OPT/FREQを最初に）
+    if calc_type == 'opt':
+        calc_type_keyword = 'OPT'
+    elif calc_type == 'freq':
+        calc_type_keyword = 'FREQ'
+    else:
+        calc_type_keyword = ''
+    
+    # 基本キーワードの構築: <calc_type> <method> <basis> TightSCF
+    calc_keywords = f"{calc_type_keyword} {method} {basis} TightSCF"
+    
+    # ★★★ 修正点: オプション設定の構築 ★★★
     optional_keywords = []
     
     # RIJCOSX設定
@@ -55,19 +67,11 @@ def generate_orca_input(config, mol_name, atoms, coords, calc_type='opt'):
     if use_rijcosx:
         optional_keywords.append('RIJCOSX')
     
-    # 溶媒設定
+    # ★★★ 修正点: 溶媒設定（空文字列チェックを追加、solvent_modelを正しく使用） ★★★
     solvent = config['orca'].get('solvent', '').strip()
-    if solvent:
+    if solvent:  # 空文字列でない場合のみ追加
         solvent_model = config['orca'].get('solvent_model', 'CPCM')
-        optional_keywords.append(f'CPCM({solvent})')
-    
-    # 計算タイプに応じた設定
-    if calc_type == 'opt':
-        calc_keywords = f"{method} {basis} OPT TightSCF"
-    elif calc_type == 'freq':
-        calc_keywords = f"{method} {basis} FREQ TightSCF"
-    else:
-        calc_keywords = f"{method} {basis} TightSCF"
+        optional_keywords.append(f'{solvent_model}({solvent})')
     
     # オプションキーワードを追加
     if optional_keywords:
