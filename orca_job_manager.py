@@ -53,22 +53,31 @@ class OrcaExecutor:
             if success:
                 self.handler.handle_success(orca_path, mol_name, calc_type, work_dir, product_dir)
             else:
-                # ★★★ ここからが変更点 ★★★
-                # 仕様書2.3.3b: ハンドラを呼ぶ *前* にリトライ回数を増やす
-                current_retries = self.state_store.increment_retry_count(str(inp_path))
+                # ★★★ ここからが変更点 (Task 2.3 依存関係の修正) ★★★
+                # OrcaExecutorはStateStoreを直接持たないため、Handler経由でアクセスする
+                current_retries = self.handler.state_store.increment_retry_count(str(inp_path))
                 self.handler.handle_failure(str(inp_path), mol_name, message, current_retries)
                 # ★★★ 変更点ここまで ★★★
                 
         except Exception as e:
             self.logger.error(f"Execution error for {mol_name} ({calc_type}): {e}")
             
-            # ★★★ ここからが変更点 ★★★
+            # ★★★ ここからが変更点 (Task 2.3 依存関係の修正) ★★★
             # 実行時例外でもリトライ回数を増やし、ハンドラに渡す
-            current_retries = self.state_store.increment_retry_count(str(inp_path))
+            current_retries = self.handler.state_store.increment_retry_count(str(inp_path))
             error_message = f'Execution Error: {e}'
             # inp_path (job_id) と エラーメッセージ、リトライ回数を渡す
             self.handler.handle_failure(str(inp_path), mol_name, error_message, current_retries)
             # ★★★ 変更点ここまで ★★★
             
         finally:
+            # ★★★ ここからが変更点 (Task 3.2 GC機能) ★★★
+            # 仕様書3.2.1a: ジョブ完了後（成功・失敗問わず）、作業ディレクトリを削除
+            try:
+                shutil.rmtree(work_dir, ignore_errors=True)
+                self.logger.info(f"Cleaned up working directory: {work_dir}")
+            except Exception as e:
+                self.logger.error(f"Failed to cleanup working directory {work_dir}: {e}")
+            # ★★★ 変更点ここまで ★★★
+
             inp_path.unlink(missing_ok=True) # 元のinpファイルを削除
