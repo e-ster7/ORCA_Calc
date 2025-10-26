@@ -67,3 +67,20 @@ class StateStore:
             if job_info['status'] in ['PENDING', 'RUNNING'] and self._same_job(job_info, new_job_info):
                 return True
         return False
+
+    # ★★★ ここからが変更点 ★★★
+    def get_jobs_by_status(self, status):
+        """
+        指定されたステータスを持つすべてのジョブを取得します。
+        (仕様書に基づく追加機能)
+        """
+        found_jobs = []
+        target_status = status.upper()
+        
+        # job_id (orca_path) と job_info の両方を返す
+        for job_id, job_info in self.job_info.items():
+            if job_info.get('status', '').upper() == target_status:
+                found_jobs.append((job_id, job_info))
+                
+        return found_jobs
+    # ★★★ 変更点ここまで ★★★
