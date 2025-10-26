@@ -28,8 +28,9 @@ class JobCompletionHandler:
         self.scheduler = scheduler # JobSchedulerのインスタンス
         self.logger = _handler_logger
         
+        # ★★★ 修正点7: max_retriesを[orca]セクションから取得 ★★★
         try:
-            self.max_retries = int(config.get('pipeline', 'max_retries', fallback=3))
+            self.max_retries = int(config.get('orca', 'max_retries', fallback=3))
         except ValueError:
             self.logger.warning("Invalid 'max_retries' in config, defaulting to 3.")
             self.max_retries = 3
@@ -51,15 +52,20 @@ class JobCompletionHandler:
         self.logger.info(f"Job completed successfully: {mol_name} ({calc_type})")
 
         output_path = orca_path.with_suffix('.out')
-        final_output_path = product_dir / output_path.name
+        
+        # ★★★ 修正点4: 分子ごとのディレクトリを作成 ★★★
+        mol_product_dir = product_dir / mol_name
+        mol_product_dir.mkdir(parents=True, exist_ok=True)
+        
+        final_output_path = mol_product_dir / output_path.name
         
         shutil.copy(output_path, final_output_path)
         self.state_store.update_status(str(final_output_path), 'COMPLETED')
 
-        generate_energy_plot(final_output_path, product_dir) # orca_utils
+        generate_energy_plot(final_output_path, mol_product_dir) # orca_utils
 
         if calc_type == 'opt':
-            self._chain_frequency_calculation(mol_name, product_dir)
+            self._chain_frequency_calculation(mol_name, mol_product_dir)
 
         send_notification(
             self.config, 
@@ -69,7 +75,6 @@ class JobCompletionHandler:
         )
 
     # --- 失敗時のハンドリング ---
-    # ★★★ ここからが変更点 ★★★
     def handle_failure(self, orca_path, mol_name, message, current_retries, error_type):
         """
         Handles ORCA job failure, checking retry counts and error type.
@@ -117,7 +122,6 @@ class JobCompletionHandler:
                 log_message,
                 throttle_instance=self.notification_throttle
             )
-    # ★★★ 変更点ここまで ★★★
 
     # --- 連鎖計算のロジック ---
     def _chain_frequency_calculation(self, mol_name, product_dir):
