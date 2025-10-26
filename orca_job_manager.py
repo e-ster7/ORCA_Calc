@@ -47,27 +47,29 @@ class OrcaExecutor:
                 )
             
             # --- 結果のチェック ---
-            success, message = check_orca_output(output_path) # orca_utilsに依存
+            # ★★★ 変更点 ★★★
+            success, message, error_type = check_orca_output(output_path) # orca_utilsに依存
             
             # --- 結果の委託 ---
             if success:
                 self.handler.handle_success(orca_path, mol_name, calc_type, work_dir, product_dir)
             else:
-                # ★★★ ここからが変更点 (Task 2.3 依存関係の修正) ★★★
+                # ★★★ ここからが変更点 ★★★
                 # OrcaExecutorはStateStoreを直接持たないため、Handler経由でアクセスする
                 current_retries = self.handler.state_store.increment_retry_count(str(inp_path))
-                self.handler.handle_failure(str(inp_path), mol_name, message, current_retries)
+                # error_type を handle_failure に渡す
+                self.handler.handle_failure(str(inp_path), mol_name, message, current_retries, error_type)
                 # ★★★ 変更点ここまで ★★★
                 
         except Exception as e:
             self.logger.error(f"Execution error for {mol_name} ({calc_type}): {e}")
             
-            # ★★★ ここからが変更点 (Task 2.3 依存関係の修正) ★★★
+            # ★★★ ここからが変更点 ★★★
             # 実行時例外でもリトライ回数を増やし、ハンドラに渡す
             current_retries = self.handler.state_store.increment_retry_count(str(inp_path))
             error_message = f'Execution Error: {e}'
-            # inp_path (job_id) と エラーメッセージ、リトライ回数を渡す
-            self.handler.handle_failure(str(inp_path), mol_name, error_message, current_retries)
+            # 実行時例外は基本的に 'FATAL' 扱いとする
+            self.handler.handle_failure(str(inp_path), mol_name, error_message, current_retries, "FATAL")
             # ★★★ 変更点ここまで ★★★
             
         finally:
