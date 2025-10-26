@@ -113,9 +113,6 @@ class MoldenService(threading.Thread):
             # 'OPT' を 'SP' (単一点計算) に置き換える
             calc_keywords = self.orca_settings.replace("OPT", "SP")
             
-            # ★★★ ここからが変更点 ★★★
-            # ご指摘の f"""...""" 形式をやめ、一行ずつ構築する安全な方法に変更
-            
             molden_inp_lines = []
             molden_inp_lines.append(f"# Molden generation for {mol_name}")
             molden_inp_lines.append(f"! {calc_keywords}")
@@ -130,7 +127,6 @@ class MoldenService(threading.Thread):
             molden_inp_lines.append(f"*")
             
             molden_inp_content = "\n".join(molden_inp_lines)
-            # ★★★ 変更点ここまで ★★★
             
             with open(molden_inp_path, 'w') as f:
                 f.write(molden_inp_content)
@@ -165,19 +161,24 @@ class MoldenService(threading.Thread):
 
     def _extract_coords_from_out(self, output_path):
         """
-        orca_utils.py に依存しない、このクラス専用の最小限の座標パーサー。
+        orca_utils.py に依存しない、このクラス専用の座標パーサー。
+        成功時と失敗時の両方のパターンに対応。
         """
         try:
             with open(output_path, 'r', errors='ignore') as f:
                 content = f.read()
             
-            # orca_utils.py のロジックと一致させ、終了のダッシュラインを正しく指定
-            match = re.search(
-                r"FINAL COORDINATES \(CARTESIAN\)\n-+\n[^\n]*\n-+\n(.*?)\n-{10,}", 
-                content, re.DOTALL
+            # ★★★ ここからが修正部分 ★★★
+            # パターン1: 成功時の座標ブロック (CARTESIAN COORDINATES (ANGSTROEM))
+            success_pattern = re.compile(
+                r"CARTESIAN COORDINATES \(ANGSTROEM\)\s*\n-+\n(.*?)\n-{10,}",
+                re.DOTALL
             )
             
+            match = success_pattern.search(content)
+            
             if match:
+                self.logger.debug(f"Found successful optimization coordinates in {output_path.name}")
                 coords_block = match.group(1).strip()
                 coord_lines = []
                 for line in coords_block.split('\n'):
@@ -185,10 +186,35 @@ class MoldenService(threading.Thread):
                     if len(parts) >= 4:
                         # ORCA入力形式 (Element X Y Z) に戻す
                         coord_lines.append(f"  {parts[0]} {parts[1]} {parts[2]} {parts[3]}")
-                return "\n".join(coord_lines)
+                
+                if coord_lines:
+                    return "\n".join(coord_lines)
             
-            self.logger.warning(f"Regex failed to find FINAL COORDINATES in {output_path.name}")
+            # パターン2: 失敗時の座標ブロック (FINAL COORDINATES (CARTESIAN))
+            failure_pattern = re.compile(
+                r"FINAL COORDINATES \(CARTESIAN\)\n-+\n[^\n]*\n-+\n(.*?)\n-{10,}",
+                re.DOTALL
+            )
+            
+            match = failure_pattern.search(content)
+            
+            if match:
+                self.logger.debug(f"Found final (non-converged) coordinates in {output_path.name}")
+                coords_block = match.group(1).strip()
+                coord_lines = []
+                for line in coords_block.split('\n'):
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        # ORCA入力形式 (Element X Y Z) に戻す
+                        coord_lines.append(f"  {parts[0]} {parts[1]} {parts[2]} {parts[3]}")
+                
+                if coord_lines:
+                    return "\n".join(coord_lines)
+            # ★★★ 修正部分ここまで ★★★
+            
+            self.logger.warning(f"Could not find coordinate block in {output_path.name}")
             return None
+            
         except Exception as e:
             self.logger.error(f"Error parsing coordinates from {output_path.name}: {e}")
             return None
