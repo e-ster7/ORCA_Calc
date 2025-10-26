@@ -1,4 +1,5 @@
-# orca_executor.py
+
+# orca_job_manager.py (OrcaExecutor クラスを定義)
 import subprocess
 import shutil
 from pathlib import Path
