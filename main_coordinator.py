@@ -155,11 +155,11 @@ def main():
         sys.exit(1)
 
     # 2. 依存関係の初期化と注入
-    
+   # --- 修正後 (L92-L113) ---
     # サービス層の初期化
     notification_throttle = NotificationThrottle()
     
-    # ★★★ 修正点5: state_file のパスを state_dir から構築 ★★★
+    # state_fileのパスを構築
     state_dir = Path(config['paths'].get('state_dir', 'folders/state'))
     ensure_directory(state_dir)
     state_file_path = state_dir / 'state_store.json'
@@ -177,17 +177,12 @@ def main():
     # 循環依存の解決: HandlerにSchedulerを注入する (DI)
     handler.set_scheduler(scheduler)
 
-    # ★★★ 修正点4: products_dir を product_dir として使用 ★★★
     # パスの検証と作成
-    path_mappings = {
-        'input_dir': 'input_dir',
-        'waiting_dir': 'waiting_dir',
-        'product_dir': 'products_dir'  # configのキー名とコード内での使用名をマッピング
-    }
-    
-    for code_key, config_key in path_mappings.items():
-        path = Path(config['paths'][config_key])
-        ensure_directory(path)
+    required_dirs = ['input_dir', 'waiting_dir', 'products_dir', 'working_dir']
+    for dir_key in required_dirs:
+        path = Path(config['paths'][dir_key])
+        ensure_directory(path) 
+
         # コード内で使用するために、正しいキー名で再設定
         if code_key != config_key:
             config['paths'][code_key] = config['paths'][config_key]
