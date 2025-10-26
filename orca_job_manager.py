@@ -26,10 +26,9 @@ class OrcaExecutor:
         
         inp_path = Path(inp_file)
         work_dir = Path(self.config['paths']['working_dir']) / inp_path.stem
-        
-        # ★★★ 修正点4: product_dir の取得（products_dir から） ★★★
-        product_dir = Path(self.config['paths'].get('product_dir', 
-                                                      self.config['paths']['products_dir']))
+        # --- 修正後 (L43-L44) ---
+        # product_dir の取得
+        product_dir = Path(self.config['paths']['products_dir'])
         
         orca_path = work_dir / inp_path.name
         output_path = work_dir / f"{inp_path.stem}.out"
