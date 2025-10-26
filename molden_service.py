@@ -5,7 +5,7 @@ import json
 import subprocess
 from pathlib import Path
 import shutil
-import re  # ★★★ 修正点 1: 'import re' を追加 ★★★
+import re
 
 # --- プロジェクト内インポート (ユーティリティのみ) ---
 from logging_utils import get_logger
@@ -76,21 +76,18 @@ class MoldenService(threading.Thread):
                 opt_out_file = mol_product_dir / f"{mol_name}_opt.out"
                 molden_file = mol_product_dir / f"{mol_name}.molden.input"
                 
-                # ★★★ 修正点 3: 無限リトライ防止 ★★★
                 # 失敗した場合のマーカーファイル
                 molden_failed_marker = mol_product_dir / f"{mol_name}.molden_failed"
                 
                 # 既に成功しているか、恒久的に失敗している場合はスキップ
                 if molden_file.exists() or molden_failed_marker.exists():
                     continue
-                # ★★★ 修正点 3 ここまで ★★★
                     
                 if not opt_out_file.exists():
                     self.logger.debug(f"opt.out not yet found for {mol_name}, skipping.")
                     continue
                 
                 self.logger.info(f"Found completed job to process for Molden: {mol_name}")
-                # 失敗マーカーファイルのパスも渡す
                 self.generate_molden_file(mol_name, mol_product_dir, opt_out_file, molden_failed_marker)
 
     def generate_molden_file(self, mol_name, mol_product_dir, opt_out_file, molden_failed_marker):
@@ -109,7 +106,6 @@ class MoldenService(threading.Thread):
             
             if not final_coords_block:
                 self.logger.warning(f"Could not extract final coords from {opt_out_file.name}")
-                # ★★★ 修正点 3: 失敗マーカーを作成 ★★★
                 molden_failed_marker.touch()
                 return
 
@@ -117,18 +113,24 @@ class MoldenService(threading.Thread):
             # 'OPT' を 'SP' (単一点計算) に置き換える
             calc_keywords = self.orca_settings.replace("OPT", "SP")
             
-            molden_inp_content = f"""# Molden generation for {mol_name}
-! {calc_keywords}
-%pal nprocs 1 end
-%maxcore 1000
-
-# Moldenファイルを出力
-%moinp "{mol_name}.molden.input"
-
-* xyz {self.config.get('orca', 'charge', fallback=0)} {self.config.get('orca', 'multiplicity', fallback=1)}
-{final_coords_block}
-*
-
+            # ★★★ ここからが変更点 ★★★
+            # ご指摘の f"""...""" 形式をやめ、一行ずつ構築する安全な方法に変更
+            
+            molden_inp_lines = []
+            molden_inp_lines.append(f"# Molden generation for {mol_name}")
+            molden_inp_lines.append(f"! {calc_keywords}")
+            molden_inp_lines.append(f"%pal nprocs 1 end")
+            molden_inp_lines.append(f"%maxcore 1000")
+            molden_inp_lines.append(f"")
+            molden_inp_lines.append(f'# Moldenファイルを出力')
+            molden_inp_lines.append(f'%moinp "{mol_name}.molden.input"')
+            molden_inp_lines.append(f"")
+            molden_inp_lines.append(f"* xyz {self.config.get('orca', 'charge', fallback=0)} {self.config.get('orca', 'multiplicity', fallback=1)}")
+            molden_inp_lines.append(final_coords_block) # 座標ブロックを追加
+            molden_inp_lines.append(f"*")
+            
+            molden_inp_content = "\n".join(molden_inp_lines)
+            # ★★★ 変更点ここまで ★★★
             
             with open(molden_inp_path, 'w') as f:
                 f.write(molden_inp_content)
@@ -152,12 +154,10 @@ class MoldenService(threading.Thread):
                 self.logger.info(f"Successfully generated {final_dest.name}")
             else:
                 self.logger.error(f"ORCA ran but Molden file not found for {mol_name}")
-                # ★★★ 修正点 3: 失敗マーカーを作成 ★★★
                 molden_failed_marker.touch()
                 
         except Exception as e:
             self.logger.error(f"Failed to generate Molden file for {mol_name}: {e}")
-            # ★★★ 修正点 3: 失敗マーカーを作成 ★★★
             molden_failed_marker.touch()
         finally:
             # 一時的な実行ディレクトリを削除
@@ -171,13 +171,11 @@ class MoldenService(threading.Thread):
             with open(output_path, 'r', errors='ignore') as f:
                 content = f.read()
             
-            # ★★★ 修正点 2: 正規表現を修正 ★★★
             # orca_utils.py のロジックと一致させ、終了のダッシュラインを正しく指定
             match = re.search(
                 r"FINAL COORDINATES \(CARTESIAN\)\n-+\n[^\n]*\n-+\n(.*?)\n-{10,}", 
                 content, re.DOTALL
             )
-            # ★★★ 修正点 2 ここまで ★★★
             
             if match:
                 coords_block = match.group(1).strip()
