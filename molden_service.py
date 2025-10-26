@@ -23,12 +23,13 @@ class MoldenService(threading.Thread):
         self.config = config
         self.logger = get_logger('molden_service')
         self.running = True
+    # --- 修正後 (L20-L25) ---
         self.daemon = True # メインスレッドが終了したら一緒に終了
         
-        state_dir = Path(config.get('paths', 'state_dir', fallback='folders/state'))
+        state_dir = Path(config['paths'].get('state_dir', 'folders/state'))
         self.state_file = state_dir / 'state_store.json'
         
-        self.product_dir = Path(config.get('paths', 'products_dir'))
+        self.product_dir = Path(config['paths']['products_dir'])
         
         # orca_2mkl ユーティリティのパスを取得
         # orca本体と同じディレクトリにあると仮定
