@@ -1,99 +1,165 @@
-# main_coordinator.py
-# 役割: 設定、初期化、依存関係の接続、全体の実行順序の制御のみを行う
-
+# main_coordinator_and_scheduler.py
 import sys
 import time
+import threading
 from pathlib import Path
+from queue import Queue, Empty
 from watchdog.observers import Observer
 
-# --- 枝モジュールからのインポート (すべての機能クラス/関数) ---
-# このファイルで定義されていたすべての名前を、外部モジュールからインポートする
+# --- 枝モジュールからのインポート ---
+# 必要なサービスやロジックはすべて外部ファイルからインポートする
 from config_utils import load_config
 from logging_utils import get_logger, set_log_level
-from paths_utils import ensure_directory
-from notification_service import NotificationThrottle, send_notification
+from pipeline_utils import ensure_directory, LOG_DIR # ユーティリティ
 from state_store import StateStore
-from orca_job_manager import JobManager
+from notification_service import NotificationThrottle
 from file_watcher import XYZHandler, process_existing_xyz_files
-from pipeline_utils import LOG_DIR, log_filename  # 定数も枝に移動
+from orca_executor import OrcaExecutor # 新しい実行器
+from job_handler import JobCompletionHandler # 新しいハンドラ
+
+_scheduler_logger = get_logger('scheduler')
+
+class ThreadWorker(threading.Thread):
+    """Worker thread that executes jobs by calling the injected executor."""
+    def __init__(self, job_queue, manager):
+        super().__init__()
+        self.job_queue = job_queue
+        # JobSchedulerインスタンスを受け取り、executorへアクセスする
+        self.manager = manager 
+        self.daemon = True
+        self.running = True
+
+    def run(self):
+        while self.running:
+            try:
+                # job_queue.get(timeout=1) は、(inp_file, mol_name, calc_type) を返す
+                inp_file, mol_name, calc_type = self.job_queue.get(timeout=1)
+                
+                # 委託: 実行ロジックは注入されたexecutorに依頼する
+                self.manager.executor.execute(inp_file, mol_name, calc_type)
+                
+                self.job_queue.task_done()
+            except Empty:
+                continue
+            except Exception as e:
+                _scheduler_logger.error(f"Worker experienced unhandled error: {e}")
+
+    def stop(self):
+        self.running = False
+
+
+class JobScheduler:
+    """旧JobManagerの根幹: ジョブの受付、キュー管理、スレッドの開始/停止のみを行う。"""
+    
+    # 実行ロジックはexecutorインスタンスとして注入される
+    def __init__(self, config, state_store, executor):
+        # 依存関係の注入
+        self.config = config
+        self.state_store = state_store
+        self.executor = executor # 実行器 (OrcaExecutor) が注入される
+        
+        self.logger = _scheduler_logger
+        self.num_threads = int(self.config['orca']['num_threads'])
+        
+        self.job_queue = Queue()
+        self.workers = []
+        self.is_running = False
+
+    def start(self):
+        if not self.is_running:
+            self.is_running = True
+            for i in range(self.num_threads):
+                worker = ThreadWorker(self.job_queue, self)
+                self.workers.append(worker)
+                worker.start()
+            self.logger.info(f"JobScheduler started with {self.num_threads} workers.")
+
+    def shutdown(self):
+        self.is_running = False
+        for worker in self.workers:
+            worker.stop()
+
+    def join(self):
+        for worker in self.workers:
+            worker.join()
+        self.logger.info("All JobScheduler workers stopped.")
+
+    def add_job(self, inp_file, mol_name, calc_type):
+        """Adds a new job to the queue."""
+        new_job_info = {'molecule': mol_name, 'calc_type': calc_type}
+        if self.state_store.has_pending_or_running(new_job_info):
+            self.logger.warning(f"Job for {mol_name}/{calc_type} is already running or pending. Skipping.")
+            return
+
+        self.state_store.add_job(mol_name, calc_type, str(inp_file))
+        self.job_queue.put((inp_file, mol_name, calc_type))
+        self.logger.info(f"Added new job: {mol_name} ({calc_type}). Queue size: {self.job_queue.qsize()}")
+
 
 def main():
-    # -----------------------------------------------------------
+    """全体の実行順序を制御し、依存関係を注入する役割を担う幹の部分"""
+    
     # 1. 環境設定と初期化
-    # -----------------------------------------------------------
-    
-    # ログディレクトリの準備 (paths_utils.py に移動)
     ensure_directory(LOG_DIR)
-    
-    # ロギング設定 (logging_utils.py に移動)
     set_log_level('INFO')
     logger = get_logger('pipeline')
     
     try:
-        # 設定のロード (config_utils.py に移動)
         config = load_config()
     except Exception as e:
         logger.error(f"Failed to load configuration: {e}")
         sys.exit(1)
 
-    # パスの検証と作成 (paths_utils.py に移動)
+    # -----------------------------------------------------------
+    # 2. 依存関係の初期化と注入
+    # -----------------------------------------------------------
+    
+    # サービス層の初期化
+    notification_throttle = NotificationThrottle()
+    state_store = StateStore()
+    
+    # ハンドラ層の初期化 (HandlerはサービスとSchedulerに依存)
+    # 依存関係は後で注入されるため、ここでは None で初期化
+    handler = JobCompletionHandler(config, state_store, notification_throttle, scheduler=None)
+    
+    # 実行器層の初期化 (ExecutorはHandlerとConfigに依存)
+    executor = OrcaExecutor(config, handler) 
+    
+    # スケジューラ層の初期化 (SchedulerはExecutorとStateStoreに依存)
+    scheduler = JobScheduler(config, state_store, executor) 
+    
+    # 循環依存の解決: HandlerにSchedulerを注入する (DI)
+    handler.set_scheduler(scheduler)
+
+    # パスの検証と作成 (mainの初期ロジック)
     for path_key in ['input_dir', 'waiting_dir', 'product_dir']:
         path = Path(config['paths'][path_key])
         ensure_directory(path)
 
     # -----------------------------------------------------------
-    # 2. 依存関係の初期化と注入
-    # -----------------------------------------------------------
-    
-    # 通知サービス (notification_service.py に移動)
-    # Throttleはグローバル変数ではなく、ここで初期化して使用する
-    notification_throttle = NotificationThrottle()
-    
-    # 状態管理 (state_store.py に移動)
-    state_store = StateStore()
-
-    # ジョブマネージャー (orca_job_manager.py に移動)
-    # JobManagerは、通知や状態管理などの外部サービスに依存する
-    job_manager = JobManager(
-        config=config, 
-        logger=get_logger('job_manager'), 
-        state_store=state_store,
-        notification_throttle=notification_throttle
-        # JobManager内で使用される全てのユーティリティ関数（ORCA関連、I/Oなど）も、
-        # JobManagerクラスのメソッドとして組み込むか、この時点で注入する必要がある
-        # ※ここではコードが複雑になりすぎるため、JobManagerは自己完結型と仮定し、configのみ渡す
-    )
-    
-    # ファイル監視ハンドラ (file_watcher.py に移動)
-    event_handler = XYZHandler(config, job_manager)
-    observer = Observer()
-    
-    # -----------------------------------------------------------
     # 3. 実行順序の制御 (メインロジック)
     # -----------------------------------------------------------
     
-    # 既存INPファイルの処理
+    # 既存INPファイルの処理 (JobSchedulerのadd_jobを使用)
     waiting_dir = Path(config['paths']['waiting_dir'])
-    # process_existing_inp_files 関数を新たに定義し、ロジックをそちらに移動する
-    # process_existing_inp_files(config, job_manager, waiting_dir)
-    # ※元のコードの行数を維持するため、この部分は元のロジックを維持し、インポートされた機能に置き換える
-    
     existing_inp_files = list(waiting_dir.glob('*.inp'))
     if existing_inp_files:
         logger.info(f"Found {len(existing_inp_files)} existing INP files in waiting directory")
         for inp_file in existing_inp_files:
             mol_name = inp_file.stem.replace('_opt', '').replace('_freq', '')
             calc_type = 'freq' if '_freq' in inp_file.stem else 'opt'
-            job_manager.add_job(str(inp_file), mol_name, calc_type) # JobManagerの公開メソッドを呼び出す
-
-    # 既存XYZファイルの処理 (file_watcher.py に移動)
-    process_existing_xyz_files(config, job_manager) 
+            scheduler.add_job(str(inp_file), mol_name, calc_type) # スケジューラメソッドを呼び出し
     
-    # ジョブマネージャーの開始
-    job_manager.start()
+    # 既存XYZファイルの処理 (XYZHandlerのロジックを使用)
+    process_existing_xyz_files(config, scheduler) # process_existing_xyz_files はJobSchedulerに依存する
+    
+    # ジョブスケジューラの開始
+    scheduler.start()
     
     # ファイル監視の開始
     input_dir = config['paths']['input_dir']
+    event_handler = XYZHandler(config, scheduler) # XYZHandlerもJobSchedulerに依存する
+    observer = Observer()
     observer.schedule(event_handler, input_dir, recursive=False)
     observer.start()
     
@@ -106,9 +172,9 @@ def main():
     except KeyboardInterrupt:
         logger.info("Shutdown signal received")
         observer.stop()
-        job_manager.shutdown()
+        scheduler.shutdown()
         observer.join()
-        job_manager.join()
+        scheduler.join()
         logger.info("Pipeline stopped cleanly.")
 
 if __name__ == '__main__':
