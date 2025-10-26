@@ -1,4 +1,4 @@
-# main_coordinator_and_scheduler.py
+# main_coordinator.py
 import sys
 import time
 import threading
@@ -15,10 +15,7 @@ from notification_service import NotificationThrottle, send_notification
 from file_watcher import XYZHandler, process_existing_xyz_files
 from orca_executor import OrcaExecutor # 新しい実行器
 from job_handler import JobCompletionHandler # 新しいハンドラ
-
-# ★★★ 新しいファイルのインポート ★★★
 from molden_service import MoldenService 
-# ★★★ ここまで ★★★
 
 
 _scheduler_logger = get_logger('scheduler')
@@ -64,7 +61,9 @@ class JobScheduler:
         self.executor = executor # 実行器 (OrcaExecutor) が注入される
         
         self.logger = _scheduler_logger
-        self.num_threads = int(self.config['orca']['num_threads'])
+        
+        # ★★★ 修正点3: num_threads を max_parallel_jobs から取得 ★★★
+        self.num_threads = int(self.config['orca']['max_parallel_jobs'])
         
         self.job_queue = Queue()
         self.workers = []
@@ -159,7 +158,12 @@ def main():
     
     # サービス層の初期化
     notification_throttle = NotificationThrottle()
-    state_store = StateStore()
+    
+    # ★★★ 修正点5: state_file のパスを state_dir から構築 ★★★
+    state_dir = Path(config['paths'].get('state_dir', 'folders/state'))
+    ensure_directory(state_dir)
+    state_file_path = state_dir / 'state_store.json'
+    state_store = StateStore(state_file=str(state_file_path))
     
     # ハンドラ層の初期化
     handler = JobCompletionHandler(config, state_store, notification_throttle, scheduler=None)
@@ -173,10 +177,20 @@ def main():
     # 循環依存の解決: HandlerにSchedulerを注入する (DI)
     handler.set_scheduler(scheduler)
 
+    # ★★★ 修正点4: products_dir を product_dir として使用 ★★★
     # パスの検証と作成
-    for path_key in ['input_dir', 'waiting_dir', 'product_dir']:
-        path = Path(config['paths'][path_key])
+    path_mappings = {
+        'input_dir': 'input_dir',
+        'waiting_dir': 'waiting_dir',
+        'product_dir': 'products_dir'  # configのキー名とコード内での使用名をマッピング
+    }
+    
+    for code_key, config_key in path_mappings.items():
+        path = Path(config['paths'][config_key])
         ensure_directory(path)
+        # コード内で使用するために、正しいキー名で再設定
+        if code_key != config_key:
+            config['paths'][code_key] = config['paths'][config_key]
 
     # 3. 実行順序の制御 (メインロジック)
 
@@ -212,10 +226,9 @@ def main():
     # ジョブスケジューラの開始
     scheduler.start()
     
-    # ★★★ 新しいサービスの開始 (幹の変更点) ★★★
+    # Moldenサービスの開始
     molden_watcher = MoldenService(config)
     molden_watcher.start()
-    # ★★★ ここまで ★★★
     
     # ファイル監視の開始
     input_dir = config['paths']['input_dir']
@@ -234,17 +247,11 @@ def main():
         logger.info("Shutdown signal received")
         observer.stop()
         scheduler.shutdown()
-        
-        # ★★★ 新しいサービスの停止 (幹の変更点) ★★★
         molden_watcher.stop()
-        # ★★★ ここまで ★★★
         
         observer.join()
         scheduler.join()
-        
-        # ★★★ 新しいサービスの待機 (幹の変更点) ★★★
-        molden_watcher.join(timeout=5) # 5秒待ってスレッド終了を待つ
-        # ★★★ ここまで ★★★
+        molden_watcher.join(timeout=5)
         
         logger.info("Pipeline stopped cleanly.")
 
